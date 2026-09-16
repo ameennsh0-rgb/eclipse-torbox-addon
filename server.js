@@ -2,7 +2,6 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const TorrentSearchApi = require('torrent-search-api');
 
 const app = express();
 app.use(cors());
@@ -12,10 +11,7 @@ const PORT = process.env.PORT || 10000;
 const TORBOX_API_KEY = process.env.TORBOX_API_KEY;
 const TORBOX_BASE = 'https://api.torbox.app/v1/api/torrents';
 
-// Enable public providers for torrent searching
-TorrentSearchApi.enablePublicProviders();
-
-// 1. MANIFEST ENDPOINT - Registers the addon with Eclipse Music
+// 1. MANIFEST ENDPOINT
 app.get('/manifest.json', (req, res) => {
   res.json({
     id: "com.user.torbox.flac",
@@ -28,7 +24,7 @@ app.get('/manifest.json', (req, res) => {
   });
 });
 
-// 2. SEARCH ENDPOINT - Multi-Provider Torrent Search
+// 2. SEARCH ENDPOINT - Powered directly by Torbox Search API
 app.get('/search', async (req, res) => {
   const query = req.query.q;
   if (!query) {
@@ -36,58 +32,62 @@ app.get('/search', async (req, res) => {
     return res.json({ tracks: [] });
   }
 
-  console.log(`\n🔎 Received search request for: "${query}"`);
+  console.log(`\n🔎 Searching Torbox indexer for: "${query}"`);
 
   try {
-    // Attempt 1: Search specifically for FLAC releases across public providers
-    let torrents = await TorrentSearchApi.search(query + ' flac', 'Audio', 10);
+    // Search Torbox internal indexer for FLAC tracks
+    const torboxSearchUrl = `${TORBOX_BASE}/search?query=${encodeURIComponent(query + ' flac')}`;
+    const searchRes = await axios.get(torboxSearchUrl, {
+      headers: { Authorization: `Bearer ${TORBOX_API_KEY}` },
+      timeout: 10000
+    });
 
-    // Attempt 2: Fallback to general query if no explicit FLAC torrents are returned
-    if (!torrents || torrents.length === 0) {
-      console.log(`ℹ️ No direct FLAC hits for "${query}". Trying fallback search...`);
-      torrents = await TorrentSearchApi.search(query, 'Audio', 10);
+    let results = searchRes.data?.data || [];
+
+    // Fallback search without 'flac' keyword if empty
+    if (results.length === 0) {
+      console.log(`ℹ️ No direct FLAC hits. Trying general search for "${query}"...`);
+      const fallbackUrl = `${TORBOX_BASE}/search?query=${encodeURIComponent(query)}`;
+      const fallbackRes = await axios.get(fallbackUrl, {
+        headers: { Authorization: `Bearer ${TORBOX_API_KEY}` },
+        timeout: 10000
+      });
+      results = fallbackRes.data?.data || [];
     }
 
-    if (!torrents || torrents.length === 0) {
-      console.log(`❌ No torrent results found for "${query}"`);
+    if (!Array.isArray(results) || results.length === 0) {
+      console.log(`❌ No torrent results returned for "${query}"`);
       return res.json({ tracks: [] });
     }
 
-    // Resolve magnet links for top 10 results
-    const trackPromises = torrents.slice(0, 10).map(async (torrent) => {
-      try {
-        const magnet = torrent.magnet || await TorrentSearchApi.getMagnet(torrent);
-        if (!magnet) return null;
+    // Map Torbox search items into Eclipse track objects
+    const tracks = results.slice(0, 10).map((item) => {
+      const magnet = item.magnet || item.hash ? `magnet:?xt=urn:btih:${item.hash}` : null;
+      if (!magnet) return null;
 
-        return {
-          id: Buffer.from(magnet).toString('base64'),
-          title: torrent.title,
-          artist: "Torrent Source",
-          album: "FLAC Collection",
-          format: "flac"
-        };
-      } catch (err) {
-        return null;
-      }
-    });
+      return {
+        id: Buffer.from(magnet).toString('base64'),
+        title: item.name || item.title || query,
+        artist: "Torrent Source",
+        album: "FLAC Collection",
+        format: "flac"
+      };
+    }).filter(Boolean);
 
-    const resolvedTracks = await Promise.all(trackPromises);
-    const validTracks = resolvedTracks.filter(track => track !== null);
-
-    console.log(`✅ Returning ${validTracks.length} tracks to Eclipse`);
-    res.json({ tracks: validTracks });
+    console.log(`✅ Returning ${tracks.length} tracks to Eclipse`);
+    res.json({ tracks });
 
   } catch (err) {
-    console.error("❌ Search Exception:", err.message);
+    console.error("❌ Search Exception:", err.response?.data || err.message);
     res.json({ tracks: [] });
   }
 });
 
-// 3. STREAM ENDPOINT - Called when playback starts
+// 3. STREAM ENDPOINT - Fetch direct stream link via Torbox CDN
 app.get('/stream/:id', async (req, res) => {
   try {
     const magnetLink = Buffer.from(req.params.id, 'base64').toString('utf-8');
-    console.log(`\n▶️ Stream requested for magnet: ${magnetLink.slice(0, 60)}...`);
+    console.log(`\n▶️ Stream requested for magnet: ${magnetLink.slice(0, 50)}...`);
 
     const headers = { Authorization: `Bearer ${TORBOX_API_KEY}` };
 
@@ -104,42 +104,39 @@ app.get('/stream/:id', async (req, res) => {
     }
 
     const torrentId = addRes.data.data.torrent_id;
-    console.log(`📌 Magnet registered on Torbox. Torrent ID: ${torrentId}`);
+    console.log(`📌 Torrent registered on Torbox. ID: ${torrentId}`);
 
-    // Step B: Poll Torbox to isolate the largest audio file
+    // Step B: Poll Torbox for audio file ID
     let fileId = null;
     for (let attempt = 1; attempt <= 20; attempt++) {
       const listRes = await axios.get(`${TORBOX_BASE}/mylist?id=${torrentId}&bypass_cache=true`, { headers });
       const torrentInfo = Array.isArray(listRes.data?.data) ? listRes.data.data[0] : listRes.data?.data;
       const files = torrentInfo?.files || [];
 
-      // Prioritize .flac files, fallback to other audio formats if necessary
       const targetFile = files
         .filter(f => /\.(flac|mp3|m4a|wav)$/i.test(f.name))
         .sort((a, b) => b.size - a.size)[0];
 
       if (targetFile) {
         fileId = targetFile.id;
-        console.log(`✅ Selected file for streaming: ${targetFile.name}`);
+        console.log(`✅ Selected file: ${targetFile.name}`);
         break;
       }
 
-      console.log(`⏳ Waiting for metadata parsing... (Attempt ${attempt}/20)`);
       await new Promise(r => setTimeout(r, 2000));
     }
 
     if (!fileId) {
-      console.error("❌ No valid audio files found in torrent payload");
-      return res.status(404).json({ error: "No audio file found in torrent" });
+      return res.status(404).json({ error: "No valid audio files found in torrent" });
     }
 
-    // Step C: Get direct CDN link from Torbox
+    // Step C: Request CDN Link
     const dlRes = await axios.get(
       `${TORBOX_BASE}/requestdl?token=${TORBOX_API_KEY}&torrent_id=${torrentId}&file_id=${fileId}&redirect=false`
     );
 
     if (dlRes.data?.success) {
-      console.log("🚀 Stream link generated successfully. Sending to Eclipse.");
+      console.log("🚀 Link generated successfully!");
       res.json({
         url: dlRes.data.data,
         format: "flac",
@@ -150,8 +147,7 @@ app.get('/stream/:id', async (req, res) => {
         bitDepth: 16
       });
     } else {
-      console.error("❌ Torbox Download Request Error:", dlRes.data);
-      res.status(500).json({ error: "Could not request stream URL from Torbox" });
+      res.status(500).json({ error: "Could not request stream link from Torbox" });
     }
 
   } catch (err) {
@@ -162,5 +158,4 @@ app.get('/stream/:id', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`Manifest URL: http://localhost:${PORT}/manifest.json`);
 });
