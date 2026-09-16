@@ -1,11 +1,16 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const cors = require('cors');
 
 const app = express();
-app.use(cors());
 app.use(express.json());
+
+// Enable CORS for Eclipse
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  next();
+});
 
 const PORT = process.env.PORT || 10000;
 const TORBOX_API_KEY = process.env.TORBOX_API_KEY;
@@ -24,70 +29,58 @@ app.get('/manifest.json', (req, res) => {
   });
 });
 
-// 2. SEARCH ENDPOINT - Powered directly by Torbox Search API
+// 2. SEARCH ENDPOINT (BitSearch API)
 app.get('/search', async (req, res) => {
   const query = req.query.q;
-  if (!query) {
-    console.log("⚠️ Received empty search query");
-    return res.json({ tracks: [] });
-  }
+  if (!query) return res.json({ tracks: [] });
 
-  console.log(`\n🔎 Searching Torbox indexer for: "${query}"`);
+  console.log(`\n🔎 Searching torrents for: "${query}"`);
 
   try {
-    // Search Torbox internal indexer for FLAC tracks
-    const torboxSearchUrl = `${TORBOX_BASE}/search?query=${encodeURIComponent(query + ' flac')}`;
-    const searchRes = await axios.get(torboxSearchUrl, {
-      headers: { Authorization: `Bearer ${TORBOX_API_KEY}` },
-      timeout: 10000
+    // Query BitSearch for FLAC releases
+    const searchUrl = `https://bitsearch.to/api/v1/search?q=${encodeURIComponent(query + ' flac')}&category=2`;
+    const response = await axios.get(searchUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+      timeout: 8000
     });
 
-    let results = searchRes.data?.data || [];
+    const results = response.data?.results || [];
 
-    // Fallback search without 'flac' keyword if empty
     if (results.length === 0) {
-      console.log(`ℹ️ No direct FLAC hits. Trying general search for "${query}"...`);
-      const fallbackUrl = `${TORBOX_BASE}/search?query=${encodeURIComponent(query)}`;
+      console.log(`ℹ️ No direct FLAC hits. Trying general query...`);
+      const fallbackUrl = `https://bitsearch.to/api/v1/search?q=${encodeURIComponent(query)}`;
       const fallbackRes = await axios.get(fallbackUrl, {
-        headers: { Authorization: `Bearer ${TORBOX_API_KEY}` },
-        timeout: 10000
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+        timeout: 8000
       });
-      results = fallbackRes.data?.data || [];
+      results.push(...(fallbackRes.data?.results || []));
     }
 
-    if (!Array.isArray(results) || results.length === 0) {
-      console.log(`❌ No torrent results returned for "${query}"`);
-      return res.json({ tracks: [] });
-    }
-
-    // Map Torbox search items into Eclipse track objects
-    const tracks = results.slice(0, 10).map((item) => {
-      const magnet = item.magnet || item.hash ? `magnet:?xt=urn:btih:${item.hash}` : null;
-      if (!magnet) return null;
-
+    const tracks = results.slice(0, 10).map(item => {
+      if (!item.magnet) return null;
       return {
-        id: Buffer.from(magnet).toString('base64'),
-        title: item.name || item.title || query,
+        id: Buffer.from(item.magnet).toString('base64'),
+        title: item.title,
         artist: "Torrent Source",
-        album: "FLAC Collection",
+        album: "FLAC Release",
         format: "flac"
       };
     }).filter(Boolean);
 
-    console.log(`✅ Returning ${tracks.length} tracks to Eclipse`);
+    console.log(`✅ Found ${tracks.length} track(s)`);
     res.json({ tracks });
 
   } catch (err) {
-    console.error("❌ Search Exception:", err.response?.data || err.message);
+    console.error("❌ Search Exception:", err.message);
     res.json({ tracks: [] });
   }
 });
 
-// 3. STREAM ENDPOINT - Fetch direct stream link via Torbox CDN
+// 3. STREAM ENDPOINT (Torbox CDN Link)
 app.get('/stream/:id', async (req, res) => {
   try {
     const magnetLink = Buffer.from(req.params.id, 'base64').toString('utf-8');
-    console.log(`\n▶️ Stream requested for magnet: ${magnetLink.slice(0, 50)}...`);
+    console.log(`\n▶️ Requesting stream for magnet...`);
 
     const headers = { Authorization: `Bearer ${TORBOX_API_KEY}` };
 
@@ -104,11 +97,11 @@ app.get('/stream/:id', async (req, res) => {
     }
 
     const torrentId = addRes.data.data.torrent_id;
-    console.log(`📌 Torrent registered on Torbox. ID: ${torrentId}`);
+    console.log(`📌 Torrent ID: ${torrentId}`);
 
-    // Step B: Poll Torbox for audio file ID
+    // Step B: Find Audio File ID
     let fileId = null;
-    for (let attempt = 1; attempt <= 20; attempt++) {
+    for (let attempt = 1; attempt <= 15; attempt++) {
       const listRes = await axios.get(`${TORBOX_BASE}/mylist?id=${torrentId}&bypass_cache=true`, { headers });
       const torrentInfo = Array.isArray(listRes.data?.data) ? listRes.data.data[0] : listRes.data?.data;
       const files = torrentInfo?.files || [];
@@ -119,18 +112,15 @@ app.get('/stream/:id', async (req, res) => {
 
       if (targetFile) {
         fileId = targetFile.id;
-        console.log(`✅ Selected file: ${targetFile.name}`);
+        console.log(`✅ Selected File: ${targetFile.name}`);
         break;
       }
-
       await new Promise(r => setTimeout(r, 2000));
     }
 
-    if (!fileId) {
-      return res.status(404).json({ error: "No valid audio files found in torrent" });
-    }
+    if (!fileId) return res.status(404).json({ error: "No audio files found in torrent" });
 
-    // Step C: Request CDN Link
+    // Step C: Get Direct CDN Stream URL
     const dlRes = await axios.get(
       `${TORBOX_BASE}/requestdl?token=${TORBOX_API_KEY}&torrent_id=${torrentId}&file_id=${fileId}&redirect=false`
     );
@@ -142,20 +132,16 @@ app.get('/stream/:id', async (req, res) => {
         format: "flac",
         codec: "flac",
         container: "flac",
-        manifest: "none",
-        sampleRate: 44100,
-        bitDepth: 16
+        manifest: "none"
       });
     } else {
-      res.status(500).json({ error: "Could not request stream link from Torbox" });
+      res.status(500).json({ error: "Could not fetch Torbox stream link" });
     }
 
   } catch (err) {
-    console.error("❌ Stream Endpoint Exception:", err.message);
+    console.error("❌ Stream Error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Server listening on port ${PORT}`));
