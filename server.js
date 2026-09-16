@@ -1,16 +1,11 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const cors = require('cors');
 
 const app = express();
+app.use(cors());
 app.use(express.json());
-
-// Enable CORS for Eclipse
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-  next();
-});
 
 const PORT = process.env.PORT || 10000;
 const TORBOX_API_KEY = process.env.TORBOX_API_KEY;
@@ -29,7 +24,7 @@ app.get('/manifest.json', (req, res) => {
   });
 });
 
-// 2. SEARCH ENDPOINT (BitSearch API)
+// 2. SEARCH ENDPOINT (With headers to prevent block)
 app.get('/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.json({ tracks: [] });
@@ -37,23 +32,30 @@ app.get('/search', async (req, res) => {
   console.log(`\n🔎 Searching torrents for: "${query}"`);
 
   try {
-    // Query BitSearch for FLAC releases
-    const searchUrl = `https://bitsearch.to/api/v1/search?q=${encodeURIComponent(query + ' flac')}&category=2`;
+    // Search BitSearch API with browser headers
+    const searchUrl = `https://bitsearch.to/api/v1/search?q=${encodeURIComponent(query + ' flac')}`;
     const response = await axios.get(searchUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+      headers: { 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
+      },
       timeout: 8000
     });
 
-    const results = response.data?.results || [];
+    let results = response.data?.results || [];
 
+    // Fallback if no specific FLAC tag results
     if (results.length === 0) {
       console.log(`ℹ️ No direct FLAC hits. Trying general query...`);
       const fallbackUrl = `https://bitsearch.to/api/v1/search?q=${encodeURIComponent(query)}`;
       const fallbackRes = await axios.get(fallbackUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+        headers: { 
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json'
+        },
         timeout: 8000
       });
-      results.push(...(fallbackRes.data?.results || []));
+      results = fallbackRes.data?.results || [];
     }
 
     const tracks = results.slice(0, 10).map(item => {
