@@ -1,15 +1,25 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const cors = require('cors');
+const xml2js = require('xml2js');
 
 const app = express();
-app.use(cors());
 app.use(express.json());
+
+// Enable CORS for Eclipse / Stremio
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  next();
+});
 
 const PORT = process.env.PORT || 10000;
 const TORBOX_API_KEY = process.env.TORBOX_API_KEY;
+const JACKETT_URL = process.env.JACKETT_URL ? process.env.JACKETT_URL.replace(/\/$/, '') : '';
+const JACKETT_API_KEY = process.env.JACKETT_API_KEY;
+
 const TORBOX_BASE = 'https://api.torbox.app/v1/api/torrents';
+const xmlParser = new xml2js.Parser({ explicitArray: false });
 
 // 1. MANIFEST ENDPOINT
 app.get('/manifest.json', (req, res) => {
@@ -17,63 +27,67 @@ app.get('/manifest.json', (req, res) => {
     id: "com.user.torbox.flac",
     name: "Torbox FLAC Engine",
     version: "1.0.0",
-    description: "Streams high-fidelity FLAC audio from torrents via Torbox CDN",
+    description: "Streams high-fidelity FLAC audio from torrents via Jackett & Torbox",
     resources: ["search", "stream"],
     types: ["track"],
     contentType: "music"
   });
 });
 
-// 2. SEARCH ENDPOINT (With headers to prevent block)
+// 2. SEARCH ENDPOINT (Queries Jackett Torznab Feed)
 app.get('/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.json({ tracks: [] });
 
-  console.log(`\n🔎 Searching torrents for: "${query}"`);
+  console.log(`\n🔎 Querying Jackett for: "${query}"`);
 
   try {
-    // Search BitSearch API with browser headers
-    const searchUrl = `https://bitsearch.to/api/v1/search?q=${encodeURIComponent(query + ' flac')}`;
-    const response = await axios.get(searchUrl, {
-      headers: { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json'
-      },
-      timeout: 8000
-    });
+    // Torznab API call to search all configured indexers (Category 3000 = Audio)
+    const searchUrl = `${JACKETT_URL}/api/v2.0/indexers/all/results/torznab/api?apikey=${JACKETT_API_KEY}&t=search&cat=3000&q=${encodeURIComponent(query)}`;
+    
+    const response = await axios.get(searchUrl, { timeout: 10000 });
+    const parsedXml = await xmlParser.parseStringPromise(response.data);
 
-    let results = response.data?.results || [];
+    const items = parsedXml?.rss?.channel?.item;
+    let resultsList = [];
 
-    // Fallback if no specific FLAC tag results
-    if (results.length === 0) {
-      console.log(`ℹ️ No direct FLAC hits. Trying general query...`);
-      const fallbackUrl = `https://bitsearch.to/api/v1/search?q=${encodeURIComponent(query)}`;
-      const fallbackRes = await axios.get(fallbackUrl, {
-        headers: { 
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'application/json'
-        },
-        timeout: 8000
-      });
-      results = fallbackRes.data?.results || [];
+    if (Array.isArray(items)) {
+      resultsList = items;
+    } else if (items) {
+      resultsList = [items];
     }
 
-    const tracks = results.slice(0, 10).map(item => {
-      if (!item.magnet) return null;
+    const tracks = resultsList.map(item => {
+      // Find magnet link in torznab attributes or enclosure
+      let magnet = null;
+      if (item.link && item.link.startsWith('magnet:')) {
+        magnet = item.link;
+      } else if (item['torznab:attr']) {
+        const attrs = Array.isArray(item['torznab:attr']) ? item['torznab:attr'] : [item['torznab:attr']];
+        const magnetAttr = attrs.find(a => a.$.name === 'magneturl');
+        if (magnetAttr) magnet = magnetAttr.$.value;
+      }
+
+      if (!magnet && item.enclosure && item.enclosure.$.url && item.enclosure.$.url.startsWith('magnet:')) {
+        magnet = item.enclosure.$.url;
+      }
+
+      if (!magnet) return null;
+
       return {
-        id: Buffer.from(item.magnet).toString('base64'),
+        id: Buffer.from(magnet).toString('base64'),
         title: item.title,
-        artist: "Torrent Source",
-        album: "FLAC Release",
-        format: "flac"
+        artist: "Jackett Release",
+        album: item.category || "Audio",
+        format: item.title.toLowerCase().includes('flac') ? 'flac' : 'mp3'
       };
     }).filter(Boolean);
 
-    console.log(`✅ Found ${tracks.length} track(s)`);
+    console.log(`✅ Found ${tracks.length} track(s) from Jackett`);
     res.json({ tracks });
 
   } catch (err) {
-    console.error("❌ Search Exception:", err.message);
+    console.error("❌ Jackett Search Error:", err.message);
     res.json({ tracks: [] });
   }
 });
@@ -82,7 +96,7 @@ app.get('/search', async (req, res) => {
 app.get('/stream/:id', async (req, res) => {
   try {
     const magnetLink = Buffer.from(req.params.id, 'base64').toString('utf-8');
-    console.log(`\n▶️ Requesting stream for magnet...`);
+    console.log(`\n▶️ Received stream request...`);
 
     const headers = { Authorization: `Bearer ${TORBOX_API_KEY}` };
 
@@ -122,13 +136,13 @@ app.get('/stream/:id', async (req, res) => {
 
     if (!fileId) return res.status(404).json({ error: "No audio files found in torrent" });
 
-    // Step C: Get Direct CDN Stream URL
+    // Step C: Request Direct CDN Stream Link
     const dlRes = await axios.get(
       `${TORBOX_BASE}/requestdl?token=${TORBOX_API_KEY}&torrent_id=${torrentId}&file_id=${fileId}&redirect=false`
     );
 
     if (dlRes.data?.success) {
-      console.log("🚀 Link generated successfully!");
+      console.log("🚀 CDN Stream Link generated!");
       res.json({
         url: dlRes.data.data,
         format: "flac",
